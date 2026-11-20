@@ -32,12 +32,13 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 	}
 
 	pool := &WorkerPool{
-		maxWorkers:  maxWorkers,
-		taskQueue:   make(chan func()),
-		workerQueue: make(chan func()),
-		stopSignal:  make(chan struct{}),
-		stoppedChan: make(chan struct{}),
+		taskQueue:    make(chan func()),
+		workerQueue:  make(chan func()),
+		stopSignal:   make(chan struct{}),
+		stoppedChan:  make(chan struct{}),
+		resizeSignal: make(chan struct{}, 1),
 	}
+	pool.maxWorkers.Store(int32(maxWorkers))
 
 	// Start the task dispatcher.
 	go pool.dispatch(cfg.idleTimeout)
@@ -48,23 +49,60 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 // WorkerPool is a collection of goroutines, where the number of concurrent
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
-	maxWorkers   int
 	taskQueue    chan func()
 	workerQueue  chan func()
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
+	resizeSignal chan struct{}
 	waitingQueue deque.Deque[func()]
 	stopLock     sync.Mutex
 	submitLock   sync.RWMutex
 	stopOnce     sync.Once
 	stopped      atomic.Bool
 	waiting      atomic.Int64
+	maxWorkers   atomic.Int32
 	wait         bool
 }
 
 // Size returns the maximum number of concurrent workers.
 func (p *WorkerPool) Size() int {
-	return p.maxWorkers
+	return int(p.maxWorkers.Load())
+}
+
+// SetSize changes the maximum number of concurrent workers while the pool is
+// running. Values less than 1 are ignored and leave the pool unchanged.
+//
+// When the size is reduced, no new workers are created beyond the new limit,
+// and workers above the limit are stopped as they finish their current task;
+// tasks already running are never interrupted. When the size is increased,
+// tasks waiting in the queue are immediately handed to newly created workers,
+// up to the new limit. Queued tasks are always delivered to workers in the
+// order they were submitted.
+//
+// SetSize is safe to call concurrently with Pause, Stop, and StopWait, and is
+// ordered with respect to them: a SetSize call happens entirely before or
+// entirely after any Pause, Stop, or StopWait call. SetSize on a stopped pool
+// has no effect.
+func (p *WorkerPool) SetSize(n int) {
+	if n < 1 {
+		return
+	}
+	// Holding stopLock orders SetSize against Pause, Stop, and StopWait, so
+	// that Pause always sees a stable worker limit and a stop cannot race
+	// with publishing a new limit.
+	p.stopLock.Lock()
+	defer p.stopLock.Unlock()
+	if p.stopped.Load() {
+		return
+	}
+	p.maxWorkers.Store(int32(n))
+	// Notify the dispatcher. If a notification is already pending, the
+	// dispatcher will read the latest limit when it wakes, so there is no
+	// need to queue another.
+	select {
+	case p.resizeSignal <- struct{}{}:
+	default:
+	}
 }
 
 // Stop stops the worker pool and waits for only currently running tasks to
@@ -203,9 +241,12 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 	if p.stopped.Load() {
 		return
 	}
+	// SetSize also holds stopLock, so the worker limit cannot change while
+	// pausing.
+	maxWorkers := int(p.maxWorkers.Load())
 	ready := new(sync.WaitGroup)
-	ready.Add(p.maxWorkers)
-	for range p.maxWorkers {
+	ready.Add(maxWorkers)
+	for range maxWorkers {
 		p.taskQueue <- func() {
 			ready.Done()
 			select {
@@ -224,6 +265,7 @@ func (p *WorkerPool) dispatch(idleTimeout time.Duration) {
 	var idle bool
 	var idleTO <-chan time.Time
 	var workerCount int
+	maxWorkers := int(p.maxWorkers.Load())
 	var wg sync.WaitGroup
 
 	var timeout *time.Timer
@@ -240,10 +282,31 @@ Loop:
 		// queue. Once the waiting queue is empty, then go back to submitting
 		// incoming tasks directly to available workers.
 		if p.waitingQueue.Len() != 0 {
-			if !p.processWaitingQueue() {
+			// Hand queued tasks to new workers if there is spare capacity.
+			// This absorbs waiting tasks after the worker limit is increased.
+			for p.waitingQueue.Len() != 0 && workerCount < maxWorkers {
+				wg.Add(1)
+				go worker(p.waitingQueue.PopFront(), p.workerQueue, &wg)
+				workerCount++
+			}
+			p.waiting.Store(int64(p.waitingQueue.Len()))
+			if p.waitingQueue.Len() == 0 {
+				// New worker capacity absorbed the whole waiting queue.
+				continue
+			}
+			var ok bool
+			if maxWorkers, workerCount, ok = p.processWaitingQueue(maxWorkers, workerCount); !ok {
 				break Loop
 			}
 			continue
+		}
+
+		// When there are more workers than the current limit, offer a kill
+		// signal to any worker that becomes ready, so excess workers are
+		// retired as they finish their current task.
+		var excessKill chan func()
+		if workerCount > maxWorkers {
+			excessKill = p.workerQueue
 		}
 
 		select {
@@ -256,7 +319,7 @@ Loop:
 			case p.workerQueue <- task:
 			default:
 				// Create a new worker, if not at max.
-				if workerCount < p.maxWorkers {
+				if workerCount < maxWorkers {
 					wg.Add(1)
 					go worker(task, p.workerQueue, &wg)
 					workerCount++
@@ -267,6 +330,11 @@ Loop:
 				}
 			}
 			idle = false
+		case excessKill <- nil:
+			// Retired a worker that was ready above the current limit.
+			workerCount--
+		case <-p.resizeSignal:
+			maxWorkers = int(p.maxWorkers.Load())
 		case <-idleTO:
 			// Timed out waiting for work to arrive. Kill a ready worker if
 			// pool has been idle for a whole timeout.
@@ -330,21 +398,41 @@ func (p *WorkerPool) stop(wait bool) {
 }
 
 // processWaitingQueue puts new tasks onto the waiting queue, and removes
-// tasks from the waiting queue as workers become available. Returns false if
-// worker pool is stopped.
-func (p *WorkerPool) processWaitingQueue() bool {
-	select {
-	case task, ok := <-p.taskQueue:
-		if !ok {
-			return false
+// tasks from the waiting queue as workers become available. While there are
+// more workers than the current limit, ready workers are retired instead of
+// being given more work, so the worker count converges to the limit as tasks
+// complete. Returns the current worker limit, the current worker count, and
+// false if the worker pool is stopped.
+func (p *WorkerPool) processWaitingQueue(maxWorkers, workerCount int) (int, int, bool) {
+	if workerCount > maxWorkers {
+		select {
+		case task, ok := <-p.taskQueue:
+			if !ok {
+				return maxWorkers, workerCount, false
+			}
+			p.waitingQueue.PushBack(task)
+		case p.workerQueue <- nil:
+			// Retired an excess worker as it became ready.
+			workerCount--
+		case <-p.resizeSignal:
+			maxWorkers = int(p.maxWorkers.Load())
 		}
-		p.waitingQueue.PushBack(task)
-	case p.workerQueue <- p.waitingQueue.Front():
-		// A worker was ready, so gave task to worker.
-		p.waitingQueue.PopFront()
+	} else {
+		select {
+		case task, ok := <-p.taskQueue:
+			if !ok {
+				return maxWorkers, workerCount, false
+			}
+			p.waitingQueue.PushBack(task)
+		case p.workerQueue <- p.waitingQueue.Front():
+			// A worker was ready, so gave task to worker.
+			p.waitingQueue.PopFront()
+		case <-p.resizeSignal:
+			maxWorkers = int(p.maxWorkers.Load())
+		}
 	}
 	p.waiting.Store(int64(p.waitingQueue.Len()))
-	return true
+	return maxWorkers, workerCount, true
 }
 
 func (p *WorkerPool) killIdleWorker() bool {
